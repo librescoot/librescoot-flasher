@@ -35,6 +35,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// On Windows, ensure disk is brought back online on exit
+	defer cleanupPlatform()
+
 	var err error
 	if *bmapPath != "" {
 		err = flashWithBmap(*imagePath, *bmapPath, *devicePath)

@@ -75,6 +75,30 @@ func openDevicePlatform(path string) (*os.File, error) {
 
 func cleanupPlatform() {}
 
+// syncDevicePlatform forces buffered writes to durable storage. On macOS,
+// fsync(2) on /dev/rdiskN frequently returns ENOTTY because raw character
+// devices don't implement it; fcntl(F_FULLFSYNC) is the documented call
+// that flushes the device's own write cache and is what dd, asr and Time
+// Machine use. We try F_FULLFSYNC first and fall back to plain Sync().
+// ENOTTY/EINVAL/ENODEV from either is treated as a no-op since we already
+// opened with F_NOCACHE (writes bypass the OS buffer cache).
+func syncDevicePlatform(f *os.File) error {
+	if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), syscall.F_FULLFSYNC, 0); errno == 0 {
+		return nil
+	} else if errno != syscall.ENOTTY && errno != syscall.EINVAL && errno != syscall.ENODEV {
+		return fmt.Errorf("fcntl F_FULLFSYNC: %w", errno)
+	}
+	if err := f.Sync(); err != nil {
+		if pe, ok := err.(*os.PathError); ok {
+			if pe.Err == syscall.ENOTTY || pe.Err == syscall.EINVAL || pe.Err == syscall.ENODEV {
+				return nil
+			}
+		}
+		return err
+	}
+	return nil
+}
+
 func receiveFd(sock int) (int, error) {
 	f := os.NewFile(uintptr(sock), "sock")
 	defer f.Close()

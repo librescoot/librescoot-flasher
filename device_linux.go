@@ -13,3 +13,5 @@ func openDevicePlatform(path string) (*os.File, error) {
 
 func cleanupPlatform() {}
 
+func syncDevicePlatform(f *os.File) error { return f.Sync() }
+

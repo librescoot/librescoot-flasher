@@ -145,7 +145,7 @@ func flashSequential(imagePath, devicePath string) error {
 		}
 	}
 
-	dev.Sync()
+	syncDevicePlatform(dev)
 	progressFinal(totalWritten)
 	fmt.Fprintf(os.Stderr, "Written %d bytes\n", totalWritten)
 	return nil
@@ -200,7 +200,7 @@ func flashTwoPhase(imagePath, devicePath string, bootBlocks int) error {
 		}
 	}
 	src.Close()
-	dev.Sync()
+	syncDevicePlatform(dev)
 	progressFinal(written)
 	fmt.Fprintf(os.Stderr, "Phase A: %d bytes written\n", written)
 
@@ -235,7 +235,7 @@ func flashTwoPhase(imagePath, devicePath string, bootBlocks int) error {
 		}
 	}
 	src.Close()
-	dev.Sync()
+	syncDevicePlatform(dev)
 	progressFinal(written)
 	fmt.Fprintf(os.Stderr, "Phase B: %d bytes written (boot area)\n", written)
 
@@ -334,7 +334,7 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 	if err != nil {
 		return err
 	}
-	if err := dev.Sync(); err != nil {
+	if err := syncDevicePlatform(dev); err != nil {
 		return fmt.Errorf("sync after phase A: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "Phase A: %d bytes written\n", writtenA)
@@ -350,7 +350,7 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 	if err != nil {
 		return err
 	}
-	if err := dev.Sync(); err != nil {
+	if err := syncDevicePlatform(dev); err != nil {
 		return fmt.Errorf("sync after phase B: %w", err)
 	}
 

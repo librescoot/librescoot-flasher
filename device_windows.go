@@ -224,3 +224,5 @@ func cleanupPlatform() {
 	}
 	heldVolumeHandles = nil
 }
+
+func syncDevicePlatform(f *os.File) error { return f.Sync() }

@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"strconv"
@@ -276,9 +277,25 @@ func (r bmapRange) parse() (start, end int64, err error) {
 	return
 }
 
-// flashWithBmap writes only mapped blocks from the bmap.
+// bootAreaBytes is the size of the U-Boot env / bootloader region kept
+// intact during phase A so a mid-flash failure leaves the device able to
+// re-enter UMS mode on next boot. Matches BOOT_AREA_BLOCKS=6 (* 4 MB)
+// used by the trampoline and the installer's two-phase fallback.
+const bootAreaBytes int64 = 24 * 1024 * 1024
+
+// flashWithBmap writes only mapped blocks from the bmap, in two passes:
+//
+//  Phase A: write everything outside the first 24 MB. Per-range SHA-256
+//           checksums (bmap-published) are verified during this pass —
+//           we read each range fully even when only part of it gets
+//           written, so the hash covers the same bytes the bmap signed.
+//  Sync.
+//  Phase B: re-open the source and write the deferred boot-area bytes.
+//
+// If anything fails before Phase B completes the U-Boot env is still the
+// pre-flash one, so the device boots back into UMS and the user can
+// retry without re-running the prep step.
 func flashWithBmap(imagePath, bmapPath, devicePath string) error {
-	// Parse bmap
 	bmapData, err := os.ReadFile(bmapPath)
 	if err != nil {
 		return fmt.Errorf("reading bmap: %w", err)
@@ -295,11 +312,10 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 		bmap.MappedBlocksCount*100/bmap.BlocksCount,
 		bmap.ImageSize, bmap.BlockSize)
 
-	src, err := openImage(imagePath)
-	if err != nil {
-		return fmt.Errorf("opening image: %w", err)
+	bs := bmap.BlockSize
+	if bs == 0 {
+		bs = 4096
 	}
-	defer src.Close()
 
 	dev, err := openDevice(devicePath)
 	if err != nil {
@@ -307,44 +323,129 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 	}
 	defer dev.Close()
 
-	bs := bmap.BlockSize
-	if bs == 0 {
-		bs = 4096
+	// Phase A: non-boot area, hash every range.
+	fmt.Fprintf(os.Stderr, "PHASE:A\n")
+	srcA, err := openImage(imagePath)
+	if err != nil {
+		return fmt.Errorf("opening image (phase A): %w", err)
 	}
-	// Use 4MB buffer for bulk writes (bmap block size is typically 4KB)
+	writtenA, checksumErrors, err := bmapPass(srcA, dev, bmap, bs, bootAreaBytes, false, 0)
+	srcA.Close()
+	if err != nil {
+		return err
+	}
+	if err := dev.Sync(); err != nil {
+		return fmt.Errorf("sync after phase A: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Phase A: %d bytes written\n", writtenA)
+
+	// Phase B: boot area only.
+	fmt.Fprintf(os.Stderr, "PHASE:B\n")
+	srcB, err := openImage(imagePath)
+	if err != nil {
+		return fmt.Errorf("opening image (phase B): %w", err)
+	}
+	defer srcB.Close()
+	writtenB, _, err := bmapPass(srcB, dev, bmap, bs, bootAreaBytes, true, writtenA)
+	if err != nil {
+		return err
+	}
+	if err := dev.Sync(); err != nil {
+		return fmt.Errorf("sync after phase B: %w", err)
+	}
+
+	totalWritten := writtenA + writtenB
+	progressFinal(totalWritten)
+	fmt.Fprintf(os.Stderr, "Phase B: %d bytes written (boot area)\n", writtenB)
+	fmt.Fprintf(os.Stderr, "Written %d bytes (%d mapped blocks)\n", totalWritten, bmap.MappedBlocksCount)
+
+	if checksumErrors > 0 {
+		return fmt.Errorf("%d checksum errors detected", checksumErrors)
+	}
+	return nil
+}
+
+// bmapPass walks the bmap ranges once. When bootPass is false (Phase A)
+// it reads & hashes every range and writes only the bytes >= bootBytes,
+// verifying per-range SHA-256 against the bmap. When bootPass is true
+// (Phase B) it skips the source for ranges entirely outside the boot
+// area and writes only the bytes < bootBytes.
+//
+// startProgress lets Phase B's progress counter pick up where Phase A
+// left off so the host UI sees a monotonic total.
+func bmapPass(src io.Reader, dev io.WriteSeeker, bmap bmapXML, bs int64, bootBytes int64, bootPass bool, startProgress int64) (int64, int, error) {
 	const writeBufSize = 4 * 1024 * 1024
 	buf := make([]byte, writeBufSize)
 
 	var srcPos int64
-	var totalWritten int64
+	var phaseWritten int64
 	var checksumErrors int
+
+	cumulative := startProgress
 
 	for _, rng := range bmap.BlockMap.Ranges {
 		start, end, err := rng.parse()
 		if err != nil {
-			return fmt.Errorf("parsing range %q: %w", rng.Value, err)
+			return phaseWritten, checksumErrors, fmt.Errorf("parsing range %q: %w", rng.Value, err)
 		}
-
 		rangeStart := start * bs
 		rangeEnd := (end + 1) * bs
 
-		// Skip unneeded source data (unmapped blocks before this range)
+		// Phase B can short-circuit ranges that don't touch the boot area.
+		if bootPass && rangeStart >= bootBytes {
+			if rangeEnd > srcPos {
+				skip := rangeEnd - srcPos
+				if _, err := io.CopyN(io.Discard, src, skip); err != nil {
+					return phaseWritten, checksumErrors, fmt.Errorf("phase B skip to %d: %w", rangeEnd, err)
+				}
+				srcPos = rangeEnd
+			}
+			continue
+		}
+
+		// Discard unmapped source bytes before this range starts.
 		if rangeStart > srcPos {
 			skip := rangeStart - srcPos
 			if _, err := io.CopyN(io.Discard, src, skip); err != nil {
-				return fmt.Errorf("skipping to offset %d: %w", rangeStart, err)
+				return phaseWritten, checksumErrors, fmt.Errorf("skip to offset %d: %w", rangeStart, err)
 			}
 			srcPos = rangeStart
 		}
 
-		// Seek device to range start
-		if _, err := dev.Seek(rangeStart, io.SeekStart); err != nil {
-			return fmt.Errorf("seeking device to %d: %w", rangeStart, err)
+		// Compute the [writeStart, writeEnd) sub-range we want to commit
+		// in this pass. Phase A: anything >= bootBytes. Phase B: anything
+		// < bootBytes.
+		var writeStart, writeEnd int64
+		if bootPass {
+			writeStart = rangeStart
+			writeEnd = rangeEnd
+			if writeEnd > bootBytes {
+				writeEnd = bootBytes
+			}
+		} else {
+			writeStart = rangeStart
+			if writeStart < bootBytes {
+				writeStart = bootBytes
+			}
+			writeEnd = rangeEnd
 		}
 
-		// Write this range in large chunks, computing checksum
-		h := sha256.New()
+		var h hash.Hash
+		if !bootPass {
+			h = sha256.New()
+		}
+
+		if writeStart < writeEnd {
+			if _, err := dev.Seek(writeStart, io.SeekStart); err != nil {
+				return phaseWritten, checksumErrors, fmt.Errorf("seek to %d: %w", writeStart, err)
+			}
+		}
+
+		// Read the entire range from source so the hash covers exactly
+		// what the bmap signed. Write only the chunk that overlaps
+		// [writeStart, writeEnd).
 		rangeRemaining := rangeEnd - rangeStart
+		rangeOffset := rangeStart
 		for rangeRemaining > 0 {
 			readSize := int64(len(buf))
 			if readSize > rangeRemaining {
@@ -352,25 +453,46 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 			}
 			n, readErr := io.ReadFull(src, buf[:readSize])
 			if n > 0 {
-				h.Write(buf[:n])
-				if _, err := dev.Write(buf[:n]); err != nil {
-					return fmt.Errorf("write at offset %d: %w", rangeEnd-rangeRemaining, err)
+				if h != nil {
+					h.Write(buf[:n])
 				}
-				totalWritten += int64(n)
+				if writeStart < writeEnd {
+					chunkStart := rangeOffset
+					chunkEnd := chunkStart + int64(n)
+					inS := writeStart
+					if chunkStart > inS {
+						inS = chunkStart
+					}
+					inE := writeEnd
+					if chunkEnd < inE {
+						inE = chunkEnd
+					}
+					if inS < inE {
+						off := inS - chunkStart
+						length := inE - inS
+						if _, err := dev.Write(buf[off : off+length]); err != nil {
+							return phaseWritten, checksumErrors, fmt.Errorf("write at offset %d: %w", inS, err)
+						}
+						phaseWritten += length
+						cumulative += length
+						progress(cumulative)
+					}
+				}
 				srcPos += int64(n)
+				rangeOffset += int64(n)
 				rangeRemaining -= int64(n)
-				progress(totalWritten)
 			}
 			if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
 				break
 			}
 			if readErr != nil {
-				return fmt.Errorf("read at offset %d: %w", rangeEnd-rangeRemaining, readErr)
+				return phaseWritten, checksumErrors, fmt.Errorf("read at offset %d: %w", rangeOffset, readErr)
 			}
 		}
 
-		// Verify checksum
-		if rng.Chksum != "" && bmap.ChecksumType == "sha256" {
+		// Per-range checksum is only meaningful in Phase A where we
+		// hashed the full source bytes for the range.
+		if !bootPass && rng.Chksum != "" && bmap.ChecksumType == "sha256" {
 			got := hex.EncodeToString(h.Sum(nil))
 			if got != rng.Chksum {
 				fmt.Fprintf(os.Stderr, "CHECKSUM MISMATCH range %d-%d: expected %s, got %s\n",
@@ -378,15 +500,7 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 				checksumErrors++
 			}
 		}
-
 	}
 
-	dev.Sync()
-	progressFinal(totalWritten)
-	fmt.Fprintf(os.Stderr, "Written %d bytes (%d mapped blocks)\n", totalWritten, bmap.MappedBlocksCount)
-
-	if checksumErrors > 0 {
-		return fmt.Errorf("%d checksum errors detected", checksumErrors)
-	}
-	return nil
+	return phaseWritten, checksumErrors, nil
 }

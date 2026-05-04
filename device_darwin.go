@@ -12,6 +12,20 @@ import (
 )
 
 func openDevicePlatform(path string) (*os.File, error) {
+	// If we're already root (e.g. installer self-elevated via osascript), skip
+	// authopen and open the device directly. authopen invoked from a root
+	// parent in a non-GUI session hits EPERM on /dev/rdiskN even though a
+	// plain root open(2) works fine.
+	if os.Geteuid() == 0 {
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			return nil, err
+		}
+		// F_NOCACHE for direct I/O (macOS equivalent of O_DIRECT)
+		syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), syscall.F_NOCACHE, 1)
+		return f, nil
+	}
+
 	// Create unix socket pair for fd passing
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {

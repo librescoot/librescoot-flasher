@@ -23,11 +23,18 @@ jobs:
             goarm: "7"
             name: linux-arm
           - goos: darwin
+            goarch: amd64
+            name: darwin-amd64
+          - goos: darwin
             goarch: arm64
             name: darwin-arm64
           - goos: windows
             goarch: amd64
             name: windows-amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            name: windows-arm64
             ext: .exe
 
     steps:

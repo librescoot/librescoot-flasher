@@ -16,6 +16,7 @@ arm:
 
 darwin:
 	$(GOFLAGS) GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o $(BIN)-darwin-arm64 .
+	$(GOFLAGS) GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o $(BIN)-darwin-amd64 .
 
 windows:
 	$(GOFLAGS) GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o $(BIN)-windows-amd64.exe .

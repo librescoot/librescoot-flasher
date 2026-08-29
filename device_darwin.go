@@ -82,6 +82,8 @@ func cleanupPlatform() {}
 // Machine use. We try F_FULLFSYNC first and fall back to plain Sync().
 // ENOTTY/EINVAL/ENODEV from either is treated as a no-op since we already
 // opened with F_NOCACHE (writes bypass the OS buffer cache).
+func finishDevicePlatform(f *os.File) error { return nil }
+
 func syncDevicePlatform(f *os.File) error {
 	if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), syscall.F_FULLFSYNC, 0); errno == 0 {
 		return nil

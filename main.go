@@ -145,7 +145,12 @@ func flashSequential(imagePath, devicePath string) error {
 		}
 	}
 
-	syncDevicePlatform(dev)
+	if err := syncDevicePlatform(dev); err != nil {
+		return fmt.Errorf("sync after write: %w", err)
+	}
+	if err := finishDevicePlatform(dev); err != nil {
+		return fmt.Errorf("protecting device after write: %w", err)
+	}
 	progressFinal(totalWritten)
 	fmt.Fprintf(os.Stderr, "Written %d bytes\n", totalWritten)
 	return nil
@@ -235,7 +240,12 @@ func flashTwoPhase(imagePath, devicePath string, bootBlocks int) error {
 		}
 	}
 	src.Close()
-	syncDevicePlatform(dev)
+	if err := syncDevicePlatform(dev); err != nil {
+		return fmt.Errorf("sync after phase B: %w", err)
+	}
+	if err := finishDevicePlatform(dev); err != nil {
+		return fmt.Errorf("protecting device after write: %w", err)
+	}
 	progressFinal(written)
 	fmt.Fprintf(os.Stderr, "Phase B: %d bytes written (boot area)\n", written)
 
@@ -285,12 +295,12 @@ const bootAreaBytes int64 = 24 * 1024 * 1024
 
 // flashWithBmap writes only mapped blocks from the bmap, in two passes:
 //
-//  Phase A: write everything outside the first 24 MB. Per-range SHA-256
-//           checksums (bmap-published) are verified during this pass —
-//           we read each range fully even when only part of it gets
-//           written, so the hash covers the same bytes the bmap signed.
-//  Sync.
-//  Phase B: re-open the source and write the deferred boot-area bytes.
+//	Phase A: write everything outside the first 24 MB. Per-range SHA-256
+//	         checksums (bmap-published) are verified during this pass —
+//	         we read each range fully even when only part of it gets
+//	         written, so the hash covers the same bytes the bmap signed.
+//	Sync.
+//	Phase B: re-open the source and write the deferred boot-area bytes.
 //
 // If anything fails before Phase B completes the U-Boot env is still the
 // pre-flash one, so the device boots back into UMS and the user can
@@ -352,6 +362,9 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 	}
 	if err := syncDevicePlatform(dev); err != nil {
 		return fmt.Errorf("sync after phase B: %w", err)
+	}
+	if err := finishDevicePlatform(dev); err != nil {
+		return fmt.Errorf("protecting device after write: %w", err)
 	}
 
 	totalWritten := writtenA + writtenB

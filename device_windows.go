@@ -226,3 +226,5 @@ func cleanupPlatform() {
 }
 
 func syncDevicePlatform(f *os.File) error { return f.Sync() }
+
+func finishDevicePlatform(f *os.File) error { return nil }

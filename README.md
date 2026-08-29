@@ -9,8 +9,9 @@ Part of the [Librescoot](https://librescoot.org/) open-source platform.
 - Sparse writes via bmap (only mapped blocks written)
 - Two-phase safe flash (partitions first, boot area last)
 - Gzip decompression on-the-fly
-- SHA256 verification of bmap ranges
-- Machine-readable progress on stderr
+- SHA256 verification of bmap source ranges
+- Direct-I/O readback verification of boot-critical mapped ranges
+- Machine-readable write and verification progress on stderr
 
 ## Usage
 
@@ -45,13 +46,17 @@ librescoot-flasher --image firmware.sdimg --device /dev/sdb
 Progress is reported on stderr:
 
 ```
-TOTAL:<bytes>       # emitted once at start (compressed size in sequential/bmap mode)
-PROGRESS:<bytes>    # emitted at most once per second (bytes written so far)
-DONE                # emitted on success
-ERROR: <message>    # emitted on failure
+TOTAL:<bytes>             # emitted once at start
+PROGRESS:<bytes>          # bytes written, at most once per second
+VERIFY_PROGRESS:<bytes>   # device bytes read back, at most once per second
+DONE                      # emitted on success
+ERROR: <message>          # emitted on failure
 ```
 
-Two-phase mode also emits `PHASE:A` and `PHASE:B` markers.
+Two-phase bmap mode emits `PHASE:write`, `PHASE:A`, `PHASE:B`, and
+`PHASE:verify`. A successful bmap flash has both durable writes and verified
+readback of every mapped range that starts within the first 24 MiB (including
+reasonably sized ranges that cross that boundary).
 
 ## Build
 

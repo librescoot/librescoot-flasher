@@ -57,6 +57,7 @@ func main() {
 
 // progress reports bytes written to stderr, throttled to at most once per second.
 var lastProgressTime time.Time
+var lastVerifyProgressTime time.Time
 
 func progress(written int64) {
 	now := time.Now()
@@ -68,6 +69,18 @@ func progress(written int64) {
 
 func progressFinal(written int64) {
 	fmt.Fprintf(os.Stderr, "PROGRESS:%d\n", written)
+}
+
+func verifyProgress(read int64) {
+	now := time.Now()
+	if now.Sub(lastVerifyProgressTime) >= time.Second {
+		fmt.Fprintf(os.Stderr, "VERIFY_PROGRESS:%d\n", read)
+		lastVerifyProgressTime = now
+	}
+}
+
+func verifyProgressFinal(read int64) {
+	fmt.Fprintf(os.Stderr, "VERIFY_PROGRESS:%d\n", read)
 }
 
 // openImage opens a firmware image, decompressing gzip if needed.
@@ -126,7 +139,11 @@ func flashSequential(imagePath, devicePath string) error {
 	}
 	defer dev.Close()
 
-	buf := make([]byte, blockSize)
+	buf, releaseBuf, err := allocDeviceBuffer(blockSize)
+	if err != nil {
+		return fmt.Errorf("allocating device buffer: %w", err)
+	}
+	defer releaseBuf()
 	var totalWritten int64
 	for {
 		n, readErr := io.ReadFull(src, buf)
@@ -184,7 +201,11 @@ func flashTwoPhase(imagePath, devicePath string, bootBlocks int) error {
 		return fmt.Errorf("seeking device: %w", err)
 	}
 
-	buf := make([]byte, blockSize)
+	buf, releaseBuf, err := allocDeviceBuffer(blockSize)
+	if err != nil {
+		return fmt.Errorf("allocating device buffer: %w", err)
+	}
+	defer releaseBuf()
 	var written int64
 	for {
 		n, readErr := io.ReadFull(src, buf)
@@ -334,12 +355,13 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 	defer dev.Close()
 
 	// Phase A: non-boot area, hash every range.
+	fmt.Fprintf(os.Stderr, "PHASE:write\n")
 	fmt.Fprintf(os.Stderr, "PHASE:A\n")
 	srcA, err := openImage(imagePath)
 	if err != nil {
 		return fmt.Errorf("opening image (phase A): %w", err)
 	}
-	writtenA, checksumErrors, err := bmapPass(srcA, dev, bmap, bs, bootAreaBytes, false, 0)
+	writtenA, sourceChecksumErrors, err := bmapPass(srcA, dev, bmap, bs, bootAreaBytes, false, 0)
 	srcA.Close()
 	if err != nil {
 		return err
@@ -363,6 +385,22 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 	if err := syncDevicePlatform(dev); err != nil {
 		return fmt.Errorf("sync after phase B: %w", err)
 	}
+
+	// Read the boot-critical mapped ranges back through the same direct-I/O
+	// descriptor while the exclusive device claim is still held. This avoids
+	// both the host page cache and an automounter race between write and verify.
+	fmt.Fprintf(os.Stderr, "PHASE:verify\n")
+	verifiedBytes, deviceMismatches, err := verifyBmapReadback(
+		dev, bmap, bs, bootAreaBytes,
+	)
+	if err != nil {
+		// Writes and flushes completed; preserve the same post-flash host-side
+		// protection even when verification itself cannot finish.
+		_ = finishDevicePlatform(dev)
+		return fmt.Errorf("device readback: %w", err)
+	}
+	verifyProgressFinal(verifiedBytes)
+
 	if err := finishDevicePlatform(dev); err != nil {
 		return fmt.Errorf("protecting device after write: %w", err)
 	}
@@ -372,8 +410,13 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 	fmt.Fprintf(os.Stderr, "Phase B: %d bytes written (boot area)\n", writtenB)
 	fmt.Fprintf(os.Stderr, "Written %d bytes (%d mapped blocks)\n", totalWritten, bmap.MappedBlocksCount)
 
-	if checksumErrors > 0 {
-		return fmt.Errorf("%d checksum errors detected", checksumErrors)
+	if sourceChecksumErrors > 0 || len(deviceMismatches) > 0 {
+		return fmt.Errorf(
+			"checksum errors: source=%d device=%d%s",
+			sourceChecksumErrors,
+			len(deviceMismatches),
+			formatRangeFailures(deviceMismatches, 5),
+		)
 	}
 	return nil
 }
@@ -388,7 +431,11 @@ func flashWithBmap(imagePath, bmapPath, devicePath string) error {
 // left off so the host UI sees a monotonic total.
 func bmapPass(src io.Reader, dev io.WriteSeeker, bmap bmapXML, bs int64, bootBytes int64, bootPass bool, startProgress int64) (int64, int, error) {
 	const writeBufSize = 4 * 1024 * 1024
-	buf := make([]byte, writeBufSize)
+	buf, releaseBuf, err := allocDeviceBuffer(writeBufSize)
+	if err != nil {
+		return 0, 0, fmt.Errorf("allocating device buffer: %w", err)
+	}
+	defer releaseBuf()
 
 	var srcPos int64
 	var phaseWritten int64
@@ -505,7 +552,7 @@ func bmapPass(src io.Reader, dev io.WriteSeeker, bmap bmapXML, bs int64, bootByt
 
 		// Per-range checksum is only meaningful in Phase A where we
 		// hashed the full source bytes for the range.
-		if !bootPass && rng.Chksum != "" && bmap.ChecksumType == "sha256" {
+		if !bootPass && rng.Chksum != "" && strings.TrimSpace(bmap.ChecksumType) == "sha256" {
 			got := hex.EncodeToString(h.Sum(nil))
 			if got != rng.Chksum {
 				fmt.Fprintf(os.Stderr, "CHECKSUM MISMATCH range %d-%d: expected %s, got %s\n",
@@ -516,4 +563,93 @@ func bmapPass(src io.Reader, dev io.WriteSeeker, bmap bmapXML, bs int64, bootByt
 	}
 
 	return phaseWritten, checksumErrors, nil
+}
+
+// verifyBmapReadback hashes complete mapped ranges in the boot-critical
+// window directly from the target. Bmap provides only whole-range checksums,
+// so a reasonably sized range crossing the boundary is verified in full.
+// Larger crossing ranges are skipped to keep readback time bounded.
+func verifyBmapReadback(dev io.ReadSeeker, bmap bmapXML, bs, limit int64) (int64, []string, error) {
+	if strings.TrimSpace(bmap.ChecksumType) != "sha256" {
+		return 0, nil, fmt.Errorf("unsupported bmap checksum type %q", bmap.ChecksumType)
+	}
+
+	const readBufSize = 4 * 1024 * 1024
+	buf, releaseBuf, err := allocDeviceBuffer(readBufSize)
+	if err != nil {
+		return 0, nil, fmt.Errorf("allocating readback buffer: %w", err)
+	}
+	defer releaseBuf()
+
+	var verified int64
+	var mismatches []string
+	for _, rng := range bmap.BlockMap.Ranges {
+		start, end, err := rng.parse()
+		if err != nil {
+			return verified, mismatches, fmt.Errorf("parsing range %q: %w", rng.Value, err)
+		}
+		rangeStart := start * bs
+		rangeEnd := (end + 1) * bs
+		if rangeStart >= limit {
+			continue
+		}
+		if rangeEnd > limit {
+			const maxBoundaryRangeBytes int64 = 32 * 1024 * 1024
+			if rangeEnd-rangeStart > maxBoundaryRangeBytes {
+				fmt.Fprintf(os.Stderr, "VERIFY_SKIP:%s crosses boot-critical boundary and is too large\n", strings.TrimSpace(rng.Value))
+				continue
+			}
+		}
+		if rng.Chksum == "" {
+			return verified, mismatches, fmt.Errorf("range %s has no checksum", strings.TrimSpace(rng.Value))
+		}
+		if _, err := dev.Seek(rangeStart, io.SeekStart); err != nil {
+			return verified, mismatches, fmt.Errorf("seeking to range %s: %w", strings.TrimSpace(rng.Value), err)
+		}
+
+		h := sha256.New()
+		remaining := rangeEnd - rangeStart
+		for remaining > 0 {
+			readSize := int64(len(buf))
+			if readSize > remaining {
+				readSize = remaining
+			}
+			n, readErr := io.ReadFull(dev, buf[:readSize])
+			if n > 0 {
+				_, _ = h.Write(buf[:n])
+				verified += int64(n)
+				remaining -= int64(n)
+				verifyProgress(verified)
+			}
+			if readErr != nil {
+				return verified, mismatches, fmt.Errorf(
+					"reading range %s at byte %d: %w",
+					strings.TrimSpace(rng.Value), rangeEnd-remaining, readErr,
+				)
+			}
+		}
+
+		got := hex.EncodeToString(h.Sum(nil))
+		if got != rng.Chksum {
+			name := strings.TrimSpace(rng.Value)
+			fmt.Fprintf(os.Stderr, "DEVICE CHECKSUM MISMATCH range %s: expected %s, got %s\n", name, rng.Chksum, got)
+			mismatches = append(mismatches, name)
+		}
+	}
+	return verified, mismatches, nil
+}
+
+func formatRangeFailures(ranges []string, max int) string {
+	if len(ranges) == 0 {
+		return ""
+	}
+	shown := ranges
+	if len(shown) > max {
+		shown = shown[:max]
+	}
+	out := " (device ranges: " + strings.Join(shown, ", ")
+	if len(ranges) > len(shown) {
+		out += fmt.Sprintf(", and %d more", len(ranges)-len(shown))
+	}
+	return out + ")"
 }

@@ -74,6 +74,21 @@ func openDevicePlatform(path string) (*os.File, error) {
 
 func cleanupPlatform() {}
 
+// O_DIRECT requires the userspace buffer itself to be page-aligned. mmap
+// provides that guarantee and lets the same descriptor be used for the
+// post-sync readback without releasing the exclusive block-device claim.
+func allocDeviceBuffer(size int) ([]byte, func(), error) {
+	buf, err := syscall.Mmap(
+		-1, 0, size,
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_PRIVATE|syscall.MAP_ANON,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return buf, func() { _ = syscall.Munmap(buf) }, nil
+}
+
 func syncDevicePlatform(f *os.File) error { return f.Sync() }
 
 // Leave the exported disk read-only before dropping the exclusive claim. That

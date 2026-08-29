@@ -75,6 +75,11 @@ func openDevicePlatform(path string) (*os.File, error) {
 
 func cleanupPlatform() {}
 
+// F_NOCACHE has no userspace-buffer alignment requirement on macOS.
+func allocDeviceBuffer(size int) ([]byte, func(), error) {
+	return make([]byte, size), func() {}, nil
+}
+
 // syncDevicePlatform forces buffered writes to durable storage. On macOS,
 // fsync(2) on /dev/rdiskN frequently returns ENOTTY because raw character
 // devices don't implement it; fcntl(F_FULLFSYNC) is the documented call

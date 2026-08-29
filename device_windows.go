@@ -19,6 +19,8 @@ var (
 	procFindFirstVolumeW = kernel32.NewProc("FindFirstVolumeW")
 	procFindNextVolumeW  = kernel32.NewProc("FindNextVolumeW")
 	procFindVolumeClose  = kernel32.NewProc("FindVolumeClose")
+	procVirtualAlloc     = kernel32.NewProc("VirtualAlloc")
+	procVirtualFree      = kernel32.NewProc("VirtualFree")
 )
 
 const (
@@ -28,6 +30,11 @@ const (
 	FILE_SHARE_WRITE                = 0x2
 	OPEN_EXISTING                   = 3
 	FILE_FLAG_WRITE_THROUGH         = 0x80000000
+	FILE_FLAG_NO_BUFFERING          = 0x20000000
+	MEM_COMMIT                      = 0x00001000
+	MEM_RESERVE                     = 0x00002000
+	MEM_RELEASE                     = 0x00008000
+	PAGE_READWRITE                  = 0x04
 	FSCTL_LOCK_VOLUME               = 0x00090018
 	FSCTL_DISMOUNT_VOLUME           = 0x00090020
 	FSCTL_ALLOW_EXTENDED_DASD_IO    = 0x00090083
@@ -80,7 +87,7 @@ func openDevicePlatform(path string) (*os.File, error) {
 		FILE_SHARE_READ|FILE_SHARE_WRITE,
 		0,
 		OPEN_EXISTING,
-		FILE_FLAG_WRITE_THROUGH,
+		FILE_FLAG_WRITE_THROUGH|FILE_FLAG_NO_BUFFERING,
 		0,
 	)
 	if h == invalidHandle {
@@ -223,6 +230,25 @@ func cleanupPlatform() {
 		syscall.CloseHandle(heldVolumeHandles[i])
 	}
 	heldVolumeHandles = nil
+}
+
+// FILE_FLAG_NO_BUFFERING requires sector-aligned buffers. VirtualAlloc is
+// aligned to the system allocation granularity, which is stricter than every
+// supported device's sector requirement.
+func allocDeviceBuffer(size int) ([]byte, func(), error) {
+	addr, _, errno := procVirtualAlloc.Call(
+		0,
+		uintptr(size),
+		MEM_COMMIT|MEM_RESERVE,
+		PAGE_READWRITE,
+	)
+	if addr == 0 {
+		return nil, nil, fmt.Errorf("VirtualAlloc: %w", errno)
+	}
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(addr)), size)
+	return buf, func() {
+		_, _, _ = procVirtualFree.Call(addr, 0, MEM_RELEASE)
+	}, nil
 }
 
 func syncDevicePlatform(f *os.File) error { return f.Sync() }
